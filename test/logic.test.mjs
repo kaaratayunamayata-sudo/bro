@@ -1,0 +1,377 @@
+// 模擬Blobsを使った対戦ロジックの検証:  node test/logic.test.mjs
+import assert from "node:assert/strict";
+
+// @netlify/blobs が未インストールでも動くよう、動的importの代わりに差し替え可能な設計になっている
+const { __setStoreFactory, handleBody, C } = await import("../netlify/functions/api.mjs").catch(async (e) => {
+  console.error("api.mjs の読み込みに失敗（npm install 済みか確認）:", e.message);
+  process.exit(1);
+});
+
+const mem = new Map();
+let etagN = 0;
+__setStoreFactory((name) => ({
+  async get(key) { const v = mem.get(name + key); return v ? JSON.parse(v.json) : null; },
+  async getWithMetadata(key) { const v = mem.get(name + key); return v ? { data: JSON.parse(v.json), etag: v.etag } : null; },
+  async setJSON(key, data, opts = {}) {
+    const k = name + key, cur = mem.get(k);
+    if (opts.onlyIfNew && cur) return { modified: false };
+    if (opts.onlyIfMatch && (!cur || cur.etag !== opts.onlyIfMatch)) return { modified: false };
+    mem.set(k, { json: JSON.stringify(data), etag: "e" + ++etagN });
+    return { modified: true, etag: "e" + etagN };
+  },
+}));
+
+// 既存テストは時間がかかるので、オンライン判定は緩めておく（新しいテストで個別に厳しくする）
+C.ONLINE_MS = 1e9;
+C.BATTLE_OFF_MS = 1e9;
+const call = async (action, body = {}) => (await handleBody({ action, ...body })).body;
+const ok = (r) => { assert.equal(r.ok, true, JSON.stringify(r)); return r; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 管理者
+assert.equal((await call("adminLogin", { password: "bad" })).ok, false);
+const adminToken = ok(await call("adminLogin", { password: "narukami" })).adminToken;
+assert.equal((await call("admin", { op: "event", status: "running" })).ok, false); // 認証なしは拒否
+ok(await call("admin", { adminToken, op: "event", status: "running" }));
+
+// ログイン & 二重ログイン防止
+const A = "hamabenokai", B = "ClumsyShuhei", D = "godhand1234";
+const ta = ok(await call("login", { name: A })).token;
+const tb = ok(await call("login", { name: B })).token;
+const td = ok(await call("login", { name: D })).token;
+ok(await call("sync", { name: A, token: ta, ping: true, activity: "select" }));
+ok(await call("sync", { name: B, token: tb, ping: true }));
+const dup = await call("login", { name: A });
+assert.equal(dup.error, "in_use");
+assert.equal(ok(await call("login", { name: A, token: ta })).token, ta); // 同端末の再開はOK
+
+// 空きマス確保（争いは発生しない）
+let r = ok(await call("claim", { name: A, token: ta, cell: 5 }));
+assert.equal(r.kind, "claimed");
+r = ok(await call("claim", { name: B, token: tb, cell: 6 }));
+assert.equal(r.kind, "claimed");
+// 偽トークン拒否
+assert.equal((await call("claim", { name: B, token: "x", cell: 7 })).ok, false);
+// 同時に同じ空きマスを狙う → 片方が確保、後着は所有者ありなので争奪戦になる
+const tdi = ok(await call("login", { name: "dicesoe" })).token;
+const [x, y] = await Promise.all([
+  call("claim", { name: D, token: td, cell: 10 }),
+  call("claim", { name: "dicesoe", token: tdi, cell: 10 }),
+]);
+ok(x); ok(y);
+assert.deepEqual([x.kind, y.kind].sort(), ["battle", "claimed"]);
+const chal = x.kind === "battle" ? D : "dicesoe", def = chal === D ? "dicesoe" : D;
+const tok = { [D]: td, dicesoe: tdi };
+const battleId = (x.kind === "battle" ? x : y).id;
+
+// 対戦中は他の操作不可 / 他人は準備できない
+assert.equal((await call("claim", { name: chal, token: tok[chal], cell: 20 })).error, "busy");
+assert.equal((await call("ready", { name: A, token: ta, id: battleId })).error, "forbidden");
+// 不戦勝は待ち時間前は不可
+ok(await call("ready", { name: chal, token: tok[chal], id: battleId }));
+assert.equal((await call("forfeit", { name: chal, token: tok[chal], id: battleId })).error, "early");
+// カウントダウン前のストップは拒否
+ok(await call("ready", { name: def, token: tok[def], id: battleId }));
+assert.equal((await call("stop", { name: chal, token: tok[chal], id: battleId })).error, "early");
+// 進行中の記録は他人に見えない
+let sy = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+assert.ok(sy.game.battles[0].stopped && !sy.game.battles[0].rec);
+
+await sleep(C.COUNTDOWN + C.DUR * 0.5); // 約50%の位置
+const s1 = ok(await call("stop", { name: chal, token: tok[chal], id: battleId }));
+assert.ok(Math.abs(s1.pos - 50) < 8, "50%付近で止まる: " + s1.pos);
+await sleep(1200);
+const s2 = ok(await call("stop", { name: def, token: tok[def], id: battleId }));
+sy = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+assert.equal(sy.game.battles.length, 0);
+const h = sy.game.history[0];
+assert.equal(h.winner, chal, "50%に近い方が勝つ");
+assert.equal(sy.game.cells[9].o, chal);
+assert.equal(sy.game.players[chal].w, 1);
+assert.equal(sy.game.players[def].l, 1);
+assert.equal((await call("stop", { name: def, token: tok[def], id: battleId })).error, "nobattle");
+
+// 敗者は陣地なし→別マス確保、挑戦者は元の陣地を手放して移動
+ok(await call("claim", { name: def, token: tok[def], cell: 11 }));
+const mv = ok(await call("claim", { name: A, token: ta, cell: 12 }));
+assert.equal(mv.kind, "claimed");
+sy = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+assert.equal(sy.game.cells[4].o, null, "移動で元のマスは空く");
+
+// 降参
+const cc = ok(await call("claim", { name: A, token: ta, cell: 6 })); // Bの陣地に挑戦
+assert.equal(cc.kind, "battle");
+ok(await call("concede", { name: B, token: tb, id: cc.id }));
+sy = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+assert.equal(sy.game.cells[5].o, A);
+
+// チャット・通報・管理者削除
+ok(await call("chat", { name: A, token: ta, text: "こんにちは" }));
+assert.equal((await call("chat", { name: A, token: ta, text: "連投" })).error, "rate");
+let ch = ok(await call("sync", { gameVer: 0, chatVer: 0 })).chat;
+const mid = ch.msgs[0].id;
+ok(await call("report", { name: B, token: tb, id: mid }));
+assert.equal(ok(await call("adminData", { adminToken })).reports.length, 1);
+ok(await call("admin", { adminToken, op: "chatDelete", id: mid }));
+ch = ok(await call("sync", { gameVer: 0, chatVer: 0 })).chat;
+assert.equal(ch.msgs[0].t, "");
+
+// 停止（BAN）
+ok(await call("admin", { adminToken, op: "ban", name: A }));
+assert.equal((await call("claim", { name: A, token: ta, cell: 1 })).ok, false);
+assert.equal((await call("login", { name: A })).error, "banned");
+ok(await call("admin", { adminToken, op: "event", status: "ended" }));
+assert.equal((await call("claim", { name: B, token: tb, cell: 1 })).error, "not_running");
+
+
+// ---------- 30マス(6x5) ----------
+{
+  const g = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.equal(g.cells.length, 30, "マスは30個");
+  assert.equal(C.CELLS, 30);
+}
+
+// ---------- 旧データ(36マス・names無し)の自動移行 ----------
+{
+  const oldG = JSON.parse(mem.get("gameg").json);
+  delete oldG.names;
+  oldG.cells = Array.from({ length: 36 }, (_, i) => ({ n: i + 1, owner: null, battle: null, at: null }));
+  oldG.cells[35].owner = "kurumi0203"; // 消えるマス
+  oldG.cells[2].owner = "kurumi0203"; // 残るマス
+  mem.set("gameg", { json: JSON.stringify(oldG), etag: "e" + ++etagN });
+  const s2 = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+  assert.equal(s2.game.cells.length, 30, "36→30に移行");
+  assert.equal(s2.names.length >= 29, true);
+  assert.equal(s2.game.cells[2].o, "kurumi0203");
+}
+
+// ---------- 管理者パスワードとテスト参加者 ----------
+{
+  await call("admin", { adminToken, op: "event", status: "running" });
+  // 認証なしは拒否
+  assert.equal((await call("admin", { op: "addTest" })).ok, false);
+  // 自動命名
+  let r2 = ok(await call("admin", { adminToken, op: "addTest", count: 2 }));
+  assert.deepEqual(r2.added, ["テスト1", "テスト2"]);
+  // 名前指定 / 重複拒否 / 予約名拒否
+  r2 = ok(await call("admin", { adminToken, op: "addTest", name: "  MyTester " }));
+  assert.deepEqual(r2.added, ["MyTester"]);
+  assert.equal((await call("admin", { adminToken, op: "addTest", name: "mytester" })).error, "dup");
+  assert.equal((await call("admin", { adminToken, op: "addTest", name: "hamabenokai" })).error, "dup");
+  assert.equal((await call("admin", { adminToken, op: "addTest", name: "運営" })).error, "bad");
+  assert.equal((await call("admin", { adminToken, op: "addTest", name: "x".repeat(25) })).error, "bad");
+  let s3 = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+  assert.ok(s3.names.includes("テスト1") && s3.game.players["テスト1"].test === true);
+  assert.equal(s3.game.players["hamabenokai"].test, undefined);
+
+  // テスト参加者でログイン→確保→対戦
+  const t1 = ok(await call("login", { name: "テスト1" })).token;
+  const t2 = ok(await call("login", { name: "テスト2" })).token;
+  ok(await call("claim", { name: "テスト1", token: t1, cell: 30 }));
+  const bt = ok(await call("claim", { name: "テスト2", token: t2, cell: 30 }));
+  assert.equal(bt.kind, "battle");
+  const tm = ok(await call("login", { name: "MyTester" })).token;
+  assert.equal((await call("claim", { name: "MyTester", token: tm, cell: 31 })).error, "bad"); // 31マス目は存在しない
+  // 削除: 対戦は取り消し・陣地は解放・本人は次のsyncでセッション無効
+  ok(await call("admin", { adminToken, op: "removeTest", name: "テスト1" }));
+  s3 = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+  assert.ok(!s3.names.includes("テスト1"));
+  assert.equal(s3.game.cells[29].o, null);
+  assert.equal(s3.game.cells[29].b, null);
+  assert.equal(s3.game.battles.length, 0);
+  const gone = ok(await call("sync", { name: "テスト1", token: t1, ping: true, gameVer: 0, chatVer: 0 }));
+  assert.equal(gone.session, false);
+  // 本物の参加者は削除できない
+  assert.equal((await call("admin", { adminToken, op: "removeTest", name: "hamabenokai" })).ok, false);
+  // 全初期化してもテスト参加者は残る
+  ok(await call("admin", { adminToken, op: "resetAll" }));
+  s3 = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+  assert.ok(s3.names.includes("テスト2") && s3.game.players["テスト2"].test === true);
+  // 上限
+  assert.equal((await call("admin", { adminToken, op: "addTest", count: 10 })).ok, true);
+  assert.equal((await call("admin", { adminToken, op: "addTest", count: 10 })).ok, true);
+  assert.equal((await call("admin", { adminToken, op: "addTest", count: 10 })).error, "limit");
+}
+
+// ---------- オフラインの人のマスは奪えない ----------
+{
+  ok(await call("admin", { adminToken, op: "event", status: "running" }));
+  ok(await call("admin", { adminToken, op: "addTest", name: "Own" }));
+  ok(await call("admin", { adminToken, op: "addTest", name: "Chal" }));
+  const to = ok(await call("login", { name: "Own" })).token;
+  const tc = ok(await call("login", { name: "Chal" })).token;
+  ok(await call("claim", { name: "Own", token: to, cell: 3 }));
+  ok(await call("logout", { name: "Own", token: to })); // オフラインになる
+  const off = await call("claim", { name: "Chal", token: tc, cell: 3 });
+  assert.equal(off.error, "offline", "オフラインの所有者のマスは奪えない");
+  const to2 = ok(await call("login", { name: "Own" })).token; // オンラインに戻る
+  const on = ok(await call("claim", { name: "Chal", token: tc, cell: 3 }));
+  assert.equal(on.kind, "battle", "オンラインなら挑戦できる");
+}
+
+// ---------- 対戦なしモード / お知らせ / タイマー / マス指定 ----------
+{
+  ok(await call("admin", { adminToken, op: "resetAll" }));
+  ok(await call("admin", { adminToken, op: "event", status: "running" }));
+  ok(await call("admin", { adminToken, op: "addTest", name: "P1" }));
+  ok(await call("admin", { adminToken, op: "addTest", name: "P2" }));
+  const p1 = ok(await call("login", { name: "P1" })).token;
+  const p2 = ok(await call("login", { name: "P2" })).token;
+  ok(await call("claim", { name: "P1", token: p1, cell: 8 }));
+  // 対戦なしモード: 確保済みには挑戦不可、空きマスの確保・移動は可能
+  ok(await call("admin", { adminToken, op: "setRules", battle: false }));
+  assert.equal(ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.rules.battle, false);
+  assert.equal((await call("claim", { name: "P2", token: p2, cell: 8 })).error, "no_battle");
+  assert.equal(ok(await call("claim", { name: "P2", token: p2, cell: 9 })).kind, "claimed");
+  assert.equal(ok(await call("claim", { name: "P2", token: p2, cell: 10 })).kind, "claimed"); // 移動
+  ok(await call("admin", { adminToken, op: "setRules", battle: true }));
+  assert.equal(ok(await call("claim", { name: "P2", token: p2, cell: 8 })).kind, "battle"); // 通常に戻ると挑戦できる
+  ok(await call("admin", { adminToken, op: "cancelBattle", id: ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.battles[0].id }));
+
+  // マス指定（運営）
+  ok(await call("admin", { adminToken, op: "setOwner", name: "P1", cell: 20 }));
+  let g = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.equal(g.cells[19].o, "P1");
+  assert.equal(g.cells[7].o, null, "元の陣地は空く");
+  assert.equal((await call("admin", { adminToken, op: "setOwner", name: "P1", cell: 31 })).ok, false);
+
+  // お知らせ
+  ok(await call("admin", { adminToken, op: "setNotice", text: "  19時開始  " }));
+  assert.equal(ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.notice, "19時開始");
+  ok(await call("admin", { adminToken, op: "setNotice", text: "" }));
+  assert.equal(ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.notice, null);
+
+  // タイマー: 自動終了
+  assert.equal((await call("admin", { adminToken, op: "setTimer", minutes: -1 })).ok, false);
+  ok(await call("admin", { adminToken, op: "setTimer", minutes: 0.01 })); // 0.6秒
+  assert.ok(ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.event.endsAt);
+  await sleep(900);
+  g = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.equal(g.event.status, "ended", "時間になったら自動終了");
+  assert.equal((await call("claim", { name: "P2", token: p2, cell: 1 })).error, "not_running");
+  // 再開すると過ぎたタイマーは破棄される
+  ok(await call("admin", { adminToken, op: "event", status: "running" }));
+  g = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.equal(g.event.status, "running");
+  assert.equal(g.event.endsAt, null);
+}
+
+// ---------- 対戦中・準備待ちに相手がオフラインになったら勝負できない ----------
+{
+  C.BATTLE_OFF_MS = 600;
+  ok(await call("admin", { adminToken, op: "addTest", name: "V1" }));
+  ok(await call("admin", { adminToken, op: "addTest", name: "V2" }));
+  const v1 = ok(await call("login", { name: "V1" })).token;
+  const v2 = ok(await call("login", { name: "V2" })).token;
+  const ping = (name, token) => call("sync", { name, token, ping: true, activity: "battle", gameVer: 0, chatVer: 0 });
+  ok(await call("claim", { name: "V1", token: v1, cell: 5 }));
+  assert.equal(ok(await call("claim", { name: "V2", token: v2, cell: 5 })).kind, "battle");
+
+  // (1) 準備待ち中に所有者が消えた → 中止
+  await sleep(900);
+  let r = ok(await ping("V2", v2));
+  assert.equal(r.game.battles.length, 0, "準備待ちの相手がオフラインなら対戦は中止");
+  assert.deepEqual(r.game.voids[0].off, ["V1"]);
+  assert.equal(r.game.voids[0].phase, "pending");
+  assert.equal(r.game.cells[4].o, "V1");
+  assert.equal(r.game.cells[4].b, null);
+  assert.equal(r.game.players["V1"].b, 0, "勝敗はつかない");
+
+  // (2) 相手がオフラインのまま「準備OK」は押せない
+  const c2 = ok(await call("claim", { name: "V2", token: v2, cell: 5 }));
+  assert.equal(c2.kind, "battle");
+  const rd = await call("ready", { name: "V2", token: v2, id: c2.id });
+  assert.equal(rd.error, "offline");
+  const bid = c2.id;
+
+  // (3) 両者オンライン → 開始 → 途中でSTOP前に片方が消えたら中止
+  await ping("V1", v1); await ping("V2", v2);
+  ok(await call("ready", { name: "V2", token: v2, id: bid }));
+  ok(await call("ready", { name: "V1", token: v1, id: bid }));
+  assert.equal(ok(await ping("V2", v2)).game.battles[0].state, "running");
+  await sleep(900);
+  r = ok(await ping("V2", v2));
+  assert.equal(r.game.battles.length, 0, "対戦中にSTOP前の相手が消えたら中止");
+  assert.equal(r.game.voids[0].phase, "running");
+  assert.equal(r.game.players["V2"].b, 0);
+  C.BATTLE_OFF_MS = 1e9;
+}
+
+// ---------- 通信速度・演出ブロードキャスト ----------
+{
+  ok(await call("admin", { adminToken, op: "setRules", speed: "fast" }));
+  let g = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.equal(g.rules.speed, "fast");
+  assert.equal(g.rules.battle !== false, true, "speedだけ変えても対戦モードは変わらない");
+  ok(await call("admin", { adminToken, op: "fx", type: "fireworks" }));
+  g = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.equal(g.fx.type, "fireworks");
+  assert.equal((await call("admin", { adminToken, op: "fx", type: "evil" })).ok, false);
+}
+
+// ---------- 当選者発表（スーパーレアスタードロップ） ----------
+{
+  const st = ok(await call("sync", { gameVer: 0, chatVer: 0 }));
+  const real = st.names.filter((n) => !st.game.players[n].test);
+  for (const n of real) {
+    ok(await call("admin", { adminToken, op: "unban", name: n }));
+    ok(await call("admin", { adminToken, op: "kick", name: n }));
+  }
+  const tok = {};
+  for (const n of real) tok[n] = ok(await call("login", { name: n })).token;
+  const winner = real[3], others = real.length - 1;
+
+  assert.equal((await call("admin", { op: "announce", winner })).ok, false, "認証なしは拒否");
+  assert.equal((await call("admin", { adminToken, op: "announce", winner: "nobody" })).error, "name");
+  assert.equal(ok(await call("myPrize", { name: real[0], token: tok[real[0]] })).draw, null, "発表前は結果なし");
+
+  const r = ok(await call("admin", { adminToken, op: "announce", winner }));
+  assert.equal(r.given, 16);
+  assert.equal(r.lost, others - 16);
+  assert.equal((await call("admin", { adminToken, op: "announce", winner: real[0] })).error, "drawn", "二重発表は拒否");
+
+  // 公開データには当選者の名前だけ。リンクも割り当ても漏れない
+  const pub = ok(await call("sync", { gameVer: 0, chatVer: 0 })).game;
+  assert.deepEqual(Object.keys(pub.draw).sort(), ["at", "id", "winner"]);
+  assert.equal(pub.draw.winner, winner);
+  assert.ok(!JSON.stringify(pub).includes("brawlstars"));
+
+  // 全員の結果: 当選者1 / リンク16(全部別) / 落選のみ
+  const urls = new Set();
+  let w = 0, v = 0, l = 0;
+  for (const n of real) {
+    const x = ok(await call("myPrize", { name: n, token: tok[n] }));
+    if (x.status === "winner") { w++; assert.equal(n, winner); assert.equal(x.url, undefined); }
+    else if (x.status === "voucher") { v++; assert.match(x.url, /^https:\/\/link\.brawlstars\.com\/voucher\/[0-9a-f-]{36}$/); assert.ok(!urls.has(x.url), "リンク重複なし"); urls.add(x.url); }
+    else if (x.status === "lost") { l++; assert.equal(x.url, undefined); }
+    else assert.fail("想定外の結果: " + x.status);
+  }
+  assert.deepEqual([w, v, l], [1, 16, others - 16]);
+  assert.equal((await call("myPrize", { name: real[0], token: tok[real[1]] })).ok, false, "他人のトークンでは結果を取れない");
+  assert.equal((await call("myPrize", { name: real[0] })).ok, false);
+
+  // 運営だけが全員分の割り当てを見られる
+  const adm = ok(await call("adminData", { adminToken }));
+  assert.equal(Object.keys(adm.draw.assign).length, 16);
+  assert.equal(adm.vouchers, 16);
+  assert.equal((await call("adminData", {})).ok, false);
+
+  // 再演出: idだけ変わり、割り当ては変わらない
+  const before = JSON.stringify((ok(await call("adminData", { adminToken }))).draw.assign);
+  const id0 = pub.draw.id;
+  ok(await call("admin", { adminToken, op: "replayDraw" }));
+  assert.notEqual(ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.draw.id, id0);
+  assert.equal(JSON.stringify((ok(await call("adminData", { adminToken }))).draw.assign), before);
+
+  // 取消 → 再発表できる（テスト参加者は抽選対象外）
+  ok(await call("admin", { adminToken, op: "cancelDraw" }));
+  assert.equal(ok(await call("sync", { gameVer: 0, chatVer: 0 })).game.draw, null);
+  const r2 = ok(await call("admin", { adminToken, op: "announce", winner: real[0], onlyJoined: true }));
+  assert.equal(r2.given + r2.lost, others);
+  const draw2 = ok(await call("adminData", { adminToken })).draw;
+  assert.ok(!Object.keys(draw2.assign).includes(real[0]), "当選者にはリンクを配らない");
+  assert.ok(!Object.keys(draw2.assign).some((n) => st.game.players[n]?.test), "テスト参加者には配らない");
+  ok(await call("admin", { adminToken, op: "cancelDraw" }));
+}
+
+console.log("ALL TESTS PASSED");
